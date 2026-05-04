@@ -1,0 +1,216 @@
+name: CI (Cross-Repo)
+run-name: ci @ ${{ github.event.client_payload.sha || github.event.inputs.sha }}
+
+on:
+  repository_dispatch:
+    types: [ci]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit SHA to test"
+        required: true
+        type: string
+      ref:
+        description: "Git ref (branch name)"
+        required: false
+        default: "main"
+        type: string
+      skip_windows:
+        description: "Skip Windows CI jobs"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ci-${{ github.event.client_payload.sha || github.event.inputs.sha }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare CI
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.params.outputs.sha }}
+      ref: ${{ steps.params.outputs.ref }}
+      skip_windows: ${{ steps.params.outputs.skip_windows }}
+    steps:
+      - name: Get parameters
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "sha=${{ github.event.client_payload.sha }}" >> "$GITHUB_OUTPUT"
+            echo "ref=${{ github.event.client_payload.ref }}" >> "$GITHUB_OUTPUT"
+            skip_windows='${{ github.event.client_payload.skip_windows }}'
+          else
+            echo "sha=${{ github.event.inputs.sha }}" >> "$GITHUB_OUTPUT"
+            echo "ref=${{ github.event.inputs.ref }}" >> "$GITHUB_OUTPUT"
+            skip_windows='${{ inputs.skip_windows }}'
+          fi
+
+          skip_windows="$(printf '%s' "${skip_windows:-true}" | tr '[:upper:]' '[:lower:]')"
+          case "${skip_windows}" in
+            true|1|yes)
+              echo "skip_windows=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "skip_windows=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+  ci:
+    name: Run CI (macOS)
+    needs: [prepare]
+    runs-on: macos-latest
+    steps:
+      - name: Checkout private source code
+        uses: actions/checkout@v4
+        with:
+          repository: Voice-Wise/voicewise-electron
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Enable git long paths (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        run: git config --system core.longpaths true
+
+      - name: "Optimize I/O for Windows (use D: drive)"
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $cargoHome = "D:/a/_cargo"
+          $cargoTargetDir = "D:/a/_cargo-target"
+          $bunCache = "D:/a/_bun-cache"
+          New-Item -ItemType Directory -Force -Path $cargoHome | Out-Null
+          New-Item -ItemType Directory -Force -Path $cargoTargetDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $bunCache | Out-Null
+          echo "CARGO_HOME=$cargoHome" >> $env:GITHUB_ENV
+          echo "CARGO_TARGET_DIR=$cargoTargetDir" >> $env:GITHUB_ENV
+          echo "BUN_INSTALL_CACHE_DIR=$bunCache" >> $env:GITHUB_ENV
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.2"
+
+      - name: Cache Bun
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            D:/a/_bun-cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            native/audio-capture -> target
+          env-vars: |
+            CARGO_HOME
+            CARGO_TARGET_DIR
+
+      - name: Run typecheck
+        run: npm run typecheck
+
+      - name: Run unit tests
+        run: npm run test
+
+      - name: Run local functional tests
+        run: npm run test:functional:local
+
+      - name: Build unpacked Electron app
+        run: npm run build:unpack
+
+      - name: Smoke test packaged launch
+        run: npm run test:packaged-launch
+
+      - name: Smoke test packaged updater manifest
+        run: npm run test:packaged-updater-manifest
+
+  ci-windows:
+    name: Run CI (Windows)
+    needs: [prepare]
+    if: ${{ needs.prepare.outputs.skip_windows != 'true' }}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout private source code
+        uses: actions/checkout@v4
+        with:
+          repository: Voice-Wise/voicewise-electron
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Enable git long paths (Windows)
+        run: git config --system core.longpaths true
+
+      - name: "Optimize I/O for Windows (use D: drive)"
+        shell: pwsh
+        run: |
+          $cargoHome = "D:/a/_cargo"
+          $cargoTargetDir = "D:/a/_cargo-target"
+          $bunCache = "D:/a/_bun-cache"
+          New-Item -ItemType Directory -Force -Path $cargoHome | Out-Null
+          New-Item -ItemType Directory -Force -Path $cargoTargetDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $bunCache | Out-Null
+          echo "CARGO_HOME=$cargoHome" >> $env:GITHUB_ENV
+          echo "CARGO_TARGET_DIR=$cargoTargetDir" >> $env:GITHUB_ENV
+          echo "BUN_INSTALL_CACHE_DIR=$bunCache" >> $env:GITHUB_ENV
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.2"
+
+      - name: Cache Bun
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            D:/a/_bun-cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            native/audio-capture -> target
+          env-vars: |
+            CARGO_HOME
+            CARGO_TARGET_DIR
+
+      - name: Run typecheck
+        run: npm run typecheck
+
+      - name: Run unit tests
+        run: npm run test
+
+      - name: Run local functional tests
+        run: npm run test:functional:local
+
+      - name: Run native smoke tests
+        run: npm run test:native-smoke
+
+      - name: Build unpacked Electron app
+        run: npm run build:unpack
+
+      - name: Smoke test packaged launch
+        run: npm run test:packaged-launch
+
+      - name: Smoke test packaged updater manifest
+        run: npm run test:packaged-updater-manifest
